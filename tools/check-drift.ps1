@@ -1,12 +1,13 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
   State-drift check for the sovereign-setup baseline. Read-only unless -Record.
 
 .DESCRIPTION
-  Two independent jobs:
+  Three independent jobs:
     1. Hard security invariants, asserted with no baseline file needed.
-    2. Baseline comparison for privacy policy values, service start types,
+    2. Volatile facts that must be asserted but never compared: Defender signature age.
+    3. Baseline comparison for privacy policy values, service start types,
        scheduled task states and machine environment variables.
 
   Design note on wuauserv, deliberately not asserted on Status:
@@ -15,6 +16,13 @@
     StartType, which must never be Disabled. An alert on Status would fire on a
     healthy machine and train the owner to ignore the alert, which is worse than
     having no alert at all. Status is still collected and printed as information.
+
+  Design note on what may not enter the baseline:
+    Anything that changes by design must never be stored in the baseline snapshot,
+    or every later check reports drift and the report becomes noise. Defender
+    signature version, date and age therefore live in a separate volatile map and
+    are asserted as invariants only. Observed live: signatures were 5 days 10 hours
+    stale while the engine reported AntivirusEnabled True, with nothing asserting it.
 
   Exit codes: 0 = clean, 2 = drift or invariant failure, 3 = baseline missing.
 #>
@@ -25,6 +33,17 @@ param(
 )
 Set-StrictMode -Version Latest
 $Inv = [Globalization.CultureInfo]::InvariantCulture
+
+# ConvertFrom-Json يحوّل نص ISO إلى DateTime، ثم يطبعه -f بتقويم الجلسة.
+# هكذا ظهر 'baseline recorded: 14/03/48 10:53:49 م' في ملف مهمته كشف الانحراف.
+# ConvertFrom-Json turns the ISO string into a DateTime and -f then formats it with the
+# thread calendar. Every timestamp printed by this script goes through here instead.
+function Format-Utc {
+  param($Value)
+  if ($null -eq $Value -or "$Value" -eq '') { return '<unknown>' }
+  try { return ([datetime]$Value).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss', $Inv) + ' UTC' }
+  catch { return "$Value" }
+}
 
 $services = @('wuauserv','WinDefend','mpssvc','DiagTrack','dmwappushservice','DoSvc','PcaSvc','WerSvc')
 
@@ -70,7 +89,7 @@ $taskList = @(
   @{ Path='\Microsoft\Windows\Feedback\Siuf\'; Name='DmClientOnScenarioDownload' }
 )
 
-# Rule = Equal | NotEqual. Asserted without any baseline file.
+# Rule = Equal | NotEqual | AtMost. Asserted without any baseline file.
 $hardInvariants = @(
   @{ Key='svc-start:wuauserv';         Rule='NotEqual'; Value='Disabled';  Why='Windows Update must remain startable' }
   @{ Key='svc-start:WinDefend';        Rule='Equal';    Value='Automatic'; Why='Defender start type' }
@@ -81,6 +100,7 @@ $hardInvariants = @(
   @{ Key='fw:Private';                 Rule='Equal';    Value='True';      Why='Firewall profile Private' }
   @{ Key='fw:Public';                  Rule='Equal';    Value='True';      Why='Firewall profile Public' }
   @{ Key='mp:AntivirusEnabled';        Rule='Equal';    Value='True';      Why='Antivirus engine enabled' }
+  @{ Key='mp:SignatureAgeDays';        Rule='AtMost';   Value='7';         Why='Signature freshness: fix with Update-MpSignature' }
   @{ Key='svc-start:DiagTrack';        Rule='Equal';    Value='Disabled';  Why='Telemetry service stays disabled' }
   @{ Key='svc-start:dmwappushservice'; Rule='Equal';    Value='Disabled';  Why='WAP push service stays disabled' }
 )
@@ -142,6 +162,27 @@ function New-StateSnapshot {
   return $state
 }
 
+# حقائق متغيّرة بطبيعتها: تُؤكَّد ولا تُخزَّن، وإلا صار كل فحص لاحق انحرافاً.
+# Volatile facts: asserted, never stored, or every later check would report drift.
+function New-VolatileFacts {
+  $live = [ordered]@{}
+  try {
+    $mp   = Get-MpComputerStatus -ErrorAction Stop
+    $when = $mp.AntivirusSignatureLastUpdated
+    if ($when) {
+      $days = [int][math]::Floor(((Get-Date) - $when).TotalDays)
+      $live['mp:SignatureAgeDays'] = $days.ToString($Inv)
+      $live['mp:SignatureUpdated'] = (Format-Utc $when)
+      $live['mp:SignatureVersion'] = "$($mp.AntivirusSignatureVersion)"
+    } else {
+      foreach ($k in 'mp:SignatureAgeDays','mp:SignatureUpdated','mp:SignatureVersion') { $live[$k] = '<unknown>' }
+    }
+  } catch {
+    foreach ($k in 'mp:SignatureAgeDays','mp:SignatureUpdated','mp:SignatureVersion') { $live[$k] = '<unavailable>' }
+  }
+  return $live
+}
+
 $now = New-StateSnapshot
 
 if ($Record) {
@@ -155,18 +196,28 @@ if ($Record) {
     state      = [pscustomobject]$now
   }
   ($doc | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $BaselinePath -Encoding UTF8
-  Write-Host ("+  baseline recorded: {0} ({1} keys)" -f $BaselinePath, $now.Count) -ForegroundColor Green
+  Write-Host ("+  baseline recorded: {0} ({1} keys) at {2}" -f $BaselinePath, $now.Count, (Format-Utc $doc.createdUtc)) -ForegroundColor Green
   Write-Host '+  تم تسجيل خط الأساس. أي انحراف لاحق يُقارن به.' -ForegroundColor Green
   exit 0
 }
 
+$live = New-VolatileFacts
 $failures = 0
 
 Write-Host '=== hard invariants / الثوابت الأمنية ===' -ForegroundColor Cyan
 $invRows = foreach ($i in $hardInvariants) {
   $actual = '<not-collected>'
-  if ($now.Contains($i.Key)) { $actual = "$($now[$i.Key])" }
-  $ok = if ($i.Rule -eq 'Equal') { $actual -eq $i.Value } else { $actual -ne $i.Value }
+  if     ($live.Contains($i.Key)) { $actual = "$($live[$i.Key])" }
+  elseif ($now.Contains($i.Key))  { $actual = "$($now[$i.Key])"  }
+  $ok = switch ($i.Rule) {
+    'Equal'    { $actual -eq $i.Value }
+    'NotEqual' { $actual -ne $i.Value }
+    'AtMost'   {
+      $parsed = 0
+      if ([int]::TryParse($actual, [ref]$parsed)) { $parsed -le [int]$i.Value } else { $false }
+    }
+    default    { $false }
+  }
   if (-not $ok) { $failures++ }
   [pscustomobject]@{
     Result   = if ($ok) { 'PASS' } else { 'FAIL' }
@@ -178,11 +229,13 @@ $invRows = foreach ($i in $hardInvariants) {
 }
 $invRows | Format-Table -AutoSize
 
+# معلوماتي فقط، ليس ثابتاً. راجع ملاحظة التصميم في الرأس.
 # Informational only. Not an invariant. See the design note in the header.
 $wuStatus = '<absent>'
 if ($now.Contains('svc-status:wuauserv')) { $wuStatus = "$($now['svc-status:wuauserv'])" }
 Write-Host ("i  wuauserv Status = {0} (demand-start: Stopped is normal, StartType is the invariant)" -f $wuStatus) -ForegroundColor DarkCyan
 Write-Host  'i  حالة wuauserv معلوماتية فقط: الخدمة تعمل عند الطلب، والثابت الحقيقي هو StartType.' -ForegroundColor DarkCyan
+Write-Host ("i  Defender signatures: version {0}, published {1}" -f $live['mp:SignatureVersion'], $live['mp:SignatureUpdated']) -ForegroundColor DarkCyan
 
 if (-not (Test-Path -LiteralPath $BaselinePath)) {
   Write-Host ''
@@ -206,7 +259,7 @@ foreach ($key in @($now.Keys)) {
 
 Write-Host ''
 Write-Host '=== drift vs baseline / الانحراف عن خط الأساس ===' -ForegroundColor Cyan
-Write-Host ("baseline recorded: {0}" -f $doc.createdUtc) -ForegroundColor DarkGray
+Write-Host ("baseline recorded: {0}" -f (Format-Utc $doc.createdUtc)) -ForegroundColor DarkGray
 if (-not $driftRows.Count) {
   Write-Host ("=  no drift across {0} keys" -f $now.Count) -ForegroundColor Green
   Write-Host  '=  لا انحراف.' -ForegroundColor Green
