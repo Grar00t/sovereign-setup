@@ -14,16 +14,28 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
             [Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) { throw 'شغّل PowerShell كمسؤول / Run as administrator.' }
 
-$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-foreach ($d in @($BackupRoot, "$BackupRoot\logs", "$BackupRoot\state")) {
-  if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+# التقويم الميلادي دائماً. بلا هذا يصبح الطابع 1448xxxx على نظام بتقويم أم القرى.
+# Always Gregorian. Without this the stamp becomes 1448xxxx under the Umm al-Qura calendar.
+$Inv   = [Globalization.CultureInfo]::InvariantCulture
+$stamp = (Get-Date).ToString('yyyyMMdd-HHmmss', $Inv)
+
+$logDir   = Join-Path $BackupRoot 'logs'
+$stateDir = Join-Path $BackupRoot 'state'
+$journalPath = Join-Path $stateDir "journal-$stamp.json"
+if ($DryRun) {
+  # المحاكاة لا تُنشئ شيئاً خارج ملف سجل مؤقت.
+  $logRoot = $env:TEMP
+} else {
+  foreach ($d in @($BackupRoot, $logDir, $stateDir)) {
+    if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+  }
+  $logRoot = $logDir
 }
-$journalPath = Join-Path "$BackupRoot\state" "journal-$stamp.json"
-Start-Transcript -Path (Join-Path "$BackupRoot\logs" "apply-$stamp.log") | Out-Null
+Start-Transcript -Path (Join-Path $logRoot "apply-$stamp.log") | Out-Null
 $script:Journal = New-Object System.Collections.ArrayList
 
 function Add-J([hashtable]$e) {
-  $e['appliedUtc'] = (Get-Date).ToUniversalTime().ToString('o')
+  $e['appliedUtc'] = (Get-Date).ToUniversalTime().ToString('o', $Inv)
   [void]$script:Journal.Add([pscustomobject]$e)
   ($script:Journal | ConvertTo-Json -Depth 6) | Set-Content -Path $journalPath -Encoding UTF8
 }
@@ -62,15 +74,16 @@ function Set-Svc {
 
 function Set-Task {
   param([string]$TaskPath, [string]$TaskName)
+  # الغياب يُعلَن صراحة: لا تخلط "غير موجود على هذا البناء" مع "فشل التعطيل".
   $t = Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue
-  if (-not $t) { return }
+  if (-not $t) { Say "!  task $TaskName not present on this build" 'DarkYellow'; return }
   if ("$($t.State)" -eq 'Disabled') { Say "=  task $TaskName already disabled" 'DarkGray'; return }
   if ($DryRun) { Say "~  would disable task $TaskPath$TaskName" 'Yellow'; return }
   try {
     Disable-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction Stop | Out-Null
     Add-J @{ kind='scheduledTask'; taskPath=$TaskPath; taskName=$TaskName; oldState="$($t.State)"; newState='Disabled' }
     Say "+  task $TaskName disabled" 'Green'
-  } catch { Say "!  task $TaskName : $($_.Exception.Message)" 'Yellow' }
+  } catch { Say "!  task $TaskName failed: $($_.Exception.Message)" 'Yellow' }
 }
 
 function Set-Env {
@@ -87,8 +100,13 @@ function New-RP {
   param([string]$Description)
   if ($DryRun) { Say "~  would create restore point '$Description'" 'Yellow'; return }
   try {
-    Enable-ComputerRestore -Drive 'C:\' -ErrorAction SilentlyContinue
-    Checkpoint-Computer -Description $Description -RestorePointType 'MODIFY_SETTINGS' -ErrorAction Stop
+    if (Get-Command Checkpoint-Computer -ErrorAction SilentlyContinue) {
+      Enable-ComputerRestore -Drive 'C:\' -ErrorAction SilentlyContinue
+      Checkpoint-Computer -Description $Description -RestorePointType 'MODIFY_SETTINGS' -ErrorAction Stop
+    } else {
+      $ps5 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+      & $ps5 -NoProfile -Command "Enable-ComputerRestore -Drive 'C:\'; Checkpoint-Computer -Description '$Description' -RestorePointType MODIFY_SETTINGS"
+    }
     Say '+  restore point created' 'Green'
   } catch { Say "!  restore point skipped: $($_.Exception.Message)" 'Yellow' }
 }
@@ -115,7 +133,15 @@ if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
   Say '!  winget غير متاح في هذه الجلسة — حدّث App Installer من Microsoft Store' 'Yellow'
 } else {
   foreach ($t in $tools) {
-    $have = Get-Command $t.Probe -ErrorAction SilentlyContinue
+    $have = Get-Command $t.Probe -ErrorAction SilentlyContinue | Select-Object -First 1
+    # اختصار متجر ويندوز بحجم صفر ليس تثبيتاً.
+    if ($have -and ($have.PSObject.Properties.Name -contains 'Source')) {
+      $src = "$($have.Source)"
+      if ($src -like '*\WindowsApps\*' -and (Get-Item -LiteralPath $src -ErrorAction SilentlyContinue).Length -eq 0) {
+        Say "!  $($t.Probe) هو اختصار متجر بلا تثبيت / Store alias stub — يُعامل كغير مثبّت" 'DarkYellow'
+        $have = $null
+      }
+    }
     if ($have) { Say "=  $($t.Id) present ($($t.Probe))" 'DarkGray'; continue }
     if ($DryRun) { Say "~  would install $($t.Id)" 'Yellow'; continue }
     Say "+  installing $($t.Id)" 'Green'
@@ -126,14 +152,25 @@ if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
 
 # ---------- 2. OneDrive ----------
 Say "`n=== 2. OneDrive ===" 'Cyan'
+# الكشف بملف العميل نفسه. OneDriveSetup.exe يُشحن مع ويندوز دائماً، فوجوده ليس دليل تثبيت.
+# Detect the client binary. OneDriveSetup.exe ships with Windows regardless of installation.
+$odClients = @(
+  "$env:LOCALAPPDATA\Microsoft\OneDrive\OneDrive.exe",
+  "$env:ProgramFiles\Microsoft OneDrive\OneDrive.exe",
+  "${env:ProgramFiles(x86)}\Microsoft OneDrive\OneDrive.exe"
+) | Where-Object { $_ -and (Test-Path $_) }
 $odSetups = @("$env:SystemRoot\SysWOW64\OneDriveSetup.exe", "$env:SystemRoot\System32\OneDriveSetup.exe") |
             Where-Object { Test-Path $_ }
-if (-not $odSetups) { Say '=  OneDriveSetup.exe not found' 'DarkGray' }
-elseif ($DryRun)   { Say "~  would uninstall OneDrive via $($odSetups -join ', ')" 'Yellow' }
+if (-not $odClients) {
+  Say "=  OneDrive client not installed (setup stubs found: $($odSetups.Count)) — لا شيء لإزالته" 'DarkGray'
+}
+elseif ($DryRun) { Say "~  would uninstall OneDrive client: $($odClients -join ', ')" 'Yellow' }
 else {
   Get-Process OneDrive -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-  foreach ($s in $odSetups) { Start-Process -FilePath $s -ArgumentList '/uninstall' -Wait }
-  Add-J @{ kind='onedrive'; setups=$odSetups }
+  Start-Sleep -Seconds 2
+  foreach ($c in $odClients) { Start-Process -FilePath $c -ArgumentList '/uninstall' -Wait -ErrorAction SilentlyContinue }
+  foreach ($s in $odSetups)  { Start-Process -FilePath $s -ArgumentList '/uninstall' -Wait -ErrorAction SilentlyContinue }
+  Add-J @{ kind='onedrive'; clients=$odClients; setups=$odSetups }
   Say '+  OneDrive uninstalled (الملفات المحلية تبقى كما هي)' 'Green'
 }
 Set-Reg -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive' -Name 'DisableFileSyncNGSC' -Value 1
@@ -172,7 +209,9 @@ foreach ($n in 'SilentInstalledAppsEnabled','PreInstalledAppsEnabled','OemPreIns
 Set-Svc -Name 'DiagTrack'        -StartupType Disabled
 Set-Svc -Name 'dmwappushservice' -StartupType Disabled
 
+# ProgramDataUpdater غير موجود على البناء 26100 — يُبلَّغ عنه كـ "not present" ولا يُعدّ فشلاً.
 Set-Task -TaskPath '\Microsoft\Windows\Application Experience\' -TaskName 'Microsoft Compatibility Appraiser'
+Set-Task -TaskPath '\Microsoft\Windows\Application Experience\' -TaskName 'Microsoft Compatibility Appraiser Exp'
 Set-Task -TaskPath '\Microsoft\Windows\Application Experience\' -TaskName 'ProgramDataUpdater'
 Set-Task -TaskPath '\Microsoft\Windows\Customer Experience Improvement Program\' -TaskName 'Consolidator'
 Set-Task -TaskPath '\Microsoft\Windows\Customer Experience Improvement Program\' -TaskName 'UsbCeip'
@@ -191,12 +230,15 @@ $consumerApps = @(
 )
 if (-not $RemoveApps) { Say "=  skipped. القائمة: $($consumerApps -join ', ')" 'DarkGray' }
 else {
+  if ($PSVersionTable.PSEdition -eq 'Core' -and -not (Get-Command Get-AppxPackage -ErrorAction SilentlyContinue)) {
+    Import-Module Appx -UseWindowsPowerShell -WarningAction SilentlyContinue
+  }
   foreach ($n in $consumerApps) {
     foreach ($p in @(Get-AppxPackage -Name $n -ErrorAction SilentlyContinue)) {
       if ($DryRun) { Say "~  would remove $($p.PackageFullName)" 'Yellow'; continue }
       try {
         Remove-AppxPackage -Package $p.PackageFullName -ErrorAction Stop
-        Add-J @{ kind='appx'; packageName=$p.Name; packageFullName=$p.PackageFullName }
+        Add-J @{ kind='appx'; packageName=$p.Name; packageFullName=$p.PackageFullName; packageFamilyName=$p.PackageFamilyName }
         Say "-  removed $($p.Name)" 'Green'
       } catch { Say "!  $($p.Name): $($_.Exception.Message)" 'Yellow' }
     }
