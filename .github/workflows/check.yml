@@ -1,0 +1,63 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: parse every script
+        shell: pwsh
+        run: |
+          $bad = 0
+          Get-ChildItem -Path . -Recurse -Filter *.ps1 | ForEach-Object {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors) | Out-Null
+            if ($errors -and $errors.Count -gt 0) {
+              $bad++
+              Write-Host "FAIL $($_.Name)"
+              $errors | ForEach-Object { Write-Host "     $($_.Message)" }
+            } else {
+              Write-Host "ok   $($_.Name)"
+            }
+          }
+          if ($bad -gt 0) { exit 1 }
+
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
+          $r = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error,Warning -ExcludeRule PSAvoidUsingWriteHost,PSUseShouldProcessForStateChangingFunctions,PSUseSingularNouns,PSAvoidUsingPositionalParameters
+          $r | Format-Table -AutoSize
+          if (@($r | Where-Object { $_.Severity -eq 'Error' }).Count -gt 0) { exit 1 }
+
+      - name: repo tests
+        shell: pwsh
+        run: |
+          Install-Module Pester -Force -Scope CurrentUser -SkipPublisherCheck -MinimumVersion 5.5.0
+          Import-Module Pester -MinimumVersion 5.5.0
+          $c = New-PesterConfiguration
+          $c.Run.Path = './tests'
+          $c.Filter.Tag = 'repo'
+          $c.Run.Throw = $true
+          $c.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $c
+
+      - name: dry run
+        shell: pwsh
+        run: |
+          ./scripts/sovereign-quick.ps1 -DryRun -NoRestorePoint -DevRoot "$env:RUNNER_TEMP\dev" -BackupRoot "$env:RUNNER_TEMP\backups"
+
+      - name: undo validate on the dry-run journal
+        shell: pwsh
+        run: |
+          $j = Get-ChildItem "$env:RUNNER_TEMP\backups\state" -Filter 'journal-*.json' -ErrorAction SilentlyContinue |
+               Sort-Object LastWriteTimeUtc | Select-Object -Last 1
+          if (-not $j) { Write-Host 'no journal written by the dry run, as expected'; exit 0 }
+          ./undo/sovereign-undo.ps1 -JournalPath $j.FullName -Validate
