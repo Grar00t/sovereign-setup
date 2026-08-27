@@ -1,0 +1,22 @@
+# runtime artifacts: machine state never enters the repository
+logs/
+state/
+reports/
+tools.json
+journal-*.json
+*.log
+*.transcript
+
+# host-specific audit output written outside docs/
+/audit-*.md
+/audit-*.json
+
+# editors
+.vs/
+.vscode/
+*.user
+
+# archives and binaries
+*.zip
+*.msi
+*.exe
