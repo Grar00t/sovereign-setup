@@ -20,3 +20,7 @@ journal-*.json
 *.zip
 *.msi
 *.exe
+
+testResults.xml
+TestResults/
+*.trx
